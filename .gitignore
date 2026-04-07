@@ -1,0 +1,11 @@
+.mp4
+dataset
+full_dataset
+processed_val_112
+__pycache__/
+bad_videos
+refactor_backup_map.json
+refactor_backup_map.jsonl
+references
+sampled_manifest.jsonl
+dataset-export.h5
