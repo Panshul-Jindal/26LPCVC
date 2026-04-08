@@ -16,7 +16,11 @@ import wandb
 from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.datasets.samplers import DistributedSampler, RandomClipSampler, UniformClipSampler
-from datasets import KineticsWithVideoId
+from datasets import KineticsWithVideoId, SubsetVideoDataset, build_stratified_split
+from freeze_utils import (
+    apply_freezing, print_trainability, log_freeze_info,
+    get_run_tag, VALID_STRATEGIES,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,12 +198,21 @@ def main(args):
 
     # ── W&B initialisation ──────────────────────────────────────────────────
     if utils.is_main_process():
+        freeze_cfg = {
+            "freeze_strategy": getattr(args, "freeze_strategy", ""),
+            "freeze_ratio":    getattr(args, "freeze_ratio", None),
+            "model_name":      getattr(args, "model", "unknown"),
+            "lr":              args.lr,
+        }
+        run_tag  = get_run_tag(freeze_cfg)
+        run_name = f"{exp_name}/{run_tag}" if run_tag else exp_name
         wandb.init(
             project="lpcv2026",
-            name=exp_name,
+            name=run_name,
             config=vars(args),
             dir=log_dir,
             resume="allow",
+            tags=[exp_name, run_tag] if run_tag else [exp_name],
         )
 
     utils.init_distributed_mode(args)
@@ -213,7 +226,7 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    # ── Data loading ────────────────────────────────────────────────────────
+    # ── Data loading ──────────────────────────────────────────────────
     print("Loading data")
     val_resize_size   = tuple(args.val_resize_size)
     val_crop_size     = tuple(args.val_crop_size)
@@ -223,92 +236,118 @@ def main(args):
     train_dir = os.path.join(args.data_path, "train")
     val_dir   = os.path.join(args.data_path, "val")
 
-    if not args.test_only:
-        print("Loading training data")
-        st = time.time()
-        cache_path = _get_cache_path(train_dir, args)
-        transform_train = presets.VideoClassificationPresetTrain(
-            crop_size=train_crop_size, resize_size=train_resize_size
-        )
+    transform_train = presets.VideoClassificationPresetTrain(
+        crop_size=train_crop_size, resize_size=train_resize_size
+    )
+    transform_eval = presets.VideoClassificationPresetEval(
+        crop_size=val_crop_size, resize_size=val_resize_size
+    )
 
-        if args.cache_dataset and os.path.exists(cache_path):
-            print(f"Loading dataset_train from {cache_path}")
-            dataset, _ = torch.load(cache_path, weights_only=False)
-            dataset.transform = transform_train
-        else:
-            if args.distributed:
-                print("It is recommended to pre-compute the dataset cache on a single-gpu first.")
-            dataset = KineticsWithVideoId(
-                args.data_path,
-                frames_per_clip=args.clip_len,
-                num_classes=args.kinetics_version,
-                split="train",
-                step_between_clips=1,
-                transform=transform_train,
-                frame_rate=args.frame_rate,
-                extensions=("avi", "mp4"),
-                output_format="TCHW",
-                num_workers=args.workers,
-            )
-            if args.cache_dataset:
-                print(f"Saving dataset_train to {cache_path}")
-                utils.mkdir(os.path.dirname(cache_path))
-                utils.save_on_master((dataset, train_dir), cache_path)
-
-        print("Took", time.time() - st)
-
-    print("Loading validation data")
-    cache_path = _get_cache_path(val_dir, args)
-
+    # ── Original (held-out) val set ─ NEVER touched during training ────────
     if args.weights and args.test_only:
-        weights = torchvision.models.get_weight(args.weights)
-        transform_test = weights.transforms()
-    else:
-        transform_test = presets.VideoClassificationPresetEval(
-            crop_size=val_crop_size, resize_size=val_resize_size
-        )
+        transform_eval = torchvision.models.get_weight(args.weights).transforms()
 
-    if args.cache_dataset and os.path.exists(cache_path):
-        print(f"Loading dataset_test from {cache_path}")
-        dataset_test, _ = torch.load(cache_path, weights_only=False)
-        dataset_test.transform = transform_test
+    cache_path_val = _get_cache_path(val_dir, args)
+    if args.cache_dataset and os.path.exists(cache_path_val):
+        print(f"Loading dataset_test from {cache_path_val}")
+        dataset_test, _ = torch.load(cache_path_val, weights_only=False)
+        dataset_test.transform = transform_eval
     else:
         if args.distributed:
-            print("It is recommended to pre-compute the dataset cache on a single-gpu first.")
+            print("Recommend pre-computing dataset cache on a single GPU first.")
         dataset_test = KineticsWithVideoId(
             args.data_path,
             frames_per_clip=args.clip_len,
             num_classes=args.kinetics_version,
             split="val",
             step_between_clips=1,
-            transform=transform_test,
+            transform=transform_eval,
             frame_rate=args.frame_rate,
             extensions=("avi", "mp4"),
             output_format="TCHW",
             num_workers=args.workers,
         )
         if args.cache_dataset:
-            print(f"Saving dataset_test to {cache_path}")
-            utils.mkdir(os.path.dirname(cache_path))
-            utils.save_on_master((dataset_test, val_dir), cache_path)
+            print(f"Saving dataset_test to {cache_path_val}")
+            utils.mkdir(os.path.dirname(cache_path_val))
+            utils.save_on_master((dataset_test, val_dir), cache_path_val)
 
-    print("Creating data loaders")
-    print("Val samples:", len(dataset_test))
+    print(f"[Data] original val (held-out): {len(dataset_test.samples):,} videos")
+
     if not args.test_only:
-        print("Found", len(dataset), "videos in training dataset")
-        train_sampler = RandomClipSampler(dataset.video_clips, args.clips_per_video)
+        # ── Base training dataset (no copy, just metadata) ──────────────────────
+        print("Loading training data (building VideoClips index)...")
+        st = time.time()
+        cache_path_train = _get_cache_path(train_dir, args)
+
+        if args.cache_dataset and os.path.exists(cache_path_train):
+            print(f"Loading dataset_base from {cache_path_train}")
+            dataset_base, _ = torch.load(cache_path_train, weights_only=False)
+            dataset_base.transform = None          # transforms applied per-split
+        else:
+            if args.distributed:
+                print("Recommend pre-computing dataset cache on a single GPU first.")
+            dataset_base = KineticsWithVideoId(
+                args.data_path,
+                frames_per_clip=args.clip_len,
+                num_classes=args.kinetics_version,
+                split="train",
+                step_between_clips=1,
+                transform=None,                    # applied later per-split
+                frame_rate=args.frame_rate,
+                extensions=("avi", "mp4"),
+                output_format="TCHW",
+                num_workers=args.workers,
+            )
+            if args.cache_dataset:
+                print(f"Saving dataset_base to {cache_path_train}")
+                utils.mkdir(os.path.dirname(cache_path_train))
+                utils.save_on_master((dataset_base, train_dir), cache_path_train)
+
+        print(f"  VideoClips index built in {time.time() - st:.1f}s")
+        print(f"  Total training videos: {len(dataset_base.samples):,}")
+
+        # ── Stratified split ───────────────────────────────────────────────
+        train_clip_idx, val_clip_idx = build_stratified_split(
+            dataset_base,
+            subset_size  = getattr(args, "subset_size",   50_000),
+            val_fraction = getattr(args, "val_fraction",  0.2),
+            seed         = getattr(args, "split_seed",    42),
+        )
+
+        # Zero-copy views with per-split transforms
+        dataset        = SubsetVideoDataset(dataset_base, train_clip_idx, transform=transform_train)
+        dataset_tv     = SubsetVideoDataset(dataset_base, val_clip_idx,   transform=transform_eval)
+
+    # ── Samplers ───────────────────────────────────────────────────────────
+    print("Creating data loaders")
+
+    # Use simple sequential samplers for the subset views; the clip indices
+    # are already shuffled during split construction for train_train.
     test_sampler = UniformClipSampler(dataset_test.video_clips, args.clips_per_video)
 
     if args.distributed:
-        if not args.test_only:
-            train_sampler = DistributedSampler(train_sampler)
         test_sampler = DistributedSampler(test_sampler, shuffle=False)
 
     if not args.test_only:
+        # train_train: shuffle=True via DataLoader, no clip sampler needed
+        # (SubsetVideoDataset already maps sequential indices to the right clips)
+        train_val_sampler = UniformClipSampler(dataset_tv.video_clips, args.clips_per_video)
+        if args.distributed:
+            train_val_sampler = DistributedSampler(train_val_sampler, shuffle=False)
+
         data_loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=args.batch_size,
-            sampler=train_sampler,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
+        data_loader_tv = torch.utils.data.DataLoader(
+            dataset_tv,
+            batch_size=args.batch_size,
+            sampler=train_val_sampler,
             num_workers=args.workers,
             pin_memory=True,
             collate_fn=collate_fn,
@@ -323,10 +362,37 @@ def main(args):
         collate_fn=collate_fn,
     )
 
-    # ── Model ────────────────────────────────────────────────────────────────
+    if args.test_only:
+        num_classes = len(dataset_test.classes)
+    else:
+        num_classes = len(dataset_base.classes)
+        print(f"[Data] train_train clips: {len(dataset):,}  "
+              f"train_val clips: {len(dataset_tv):,}  "
+              f"held-out val videos: {len(dataset_test.samples):,}")
+
+    # ── Model ───────────────────────────────────────────────────────────────
     print("Creating model")
-    num_classes = len(dataset_test.classes) if args.test_only else len(dataset.classes)
     model = torchvision.models.get_model(args.model, weights=args.weights)
+    
+    if getattr(args, "pretrained_path", ""):
+        print(f"Loading custom pretrained weights from {args.pretrained_path}")
+        state_dict = torch.load(args.pretrained_path, map_location="cpu", weights_only=False)
+        # Handle dicts that wrap the model
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+        elif "model_state" in state_dict:
+            state_dict = state_dict["model_state"]
+        elif "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+            
+        # Optional: remove fc layer keys if they will clash
+        keys_to_delete = [k for k in state_dict.keys() if k.startswith("fc.")]
+        for k in keys_to_delete:
+            del state_dict[k]
+            
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(f"Pretrained weights loaded. Missing keys: {msg.missing_keys}")
+        
     model.to(device)
 
     if args.distributed and args.sync_bn:
@@ -334,32 +400,91 @@ def main(args):
 
     model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-    # Optional layer freezing for faster training
-    for name, param in model.named_parameters():
-        if not name.startswith("layer4") and not name.startswith("fc"):
-            param.requires_grad = False
+    # ── Configurable layer freezing ──────────────────────────────────────────
+    freeze_cfg = {
+        "freeze_strategy": getattr(args, "freeze_strategy", ""),
+        "freeze_ratio":    getattr(args, "freeze_ratio", None),
+        "model_name":      args.model,
+        "lr":              args.lr,
+    }
+    freeze_result = apply_freezing(model, config=freeze_cfg)
+    print(freeze_result)
+    print_trainability(model, verbose=True)
+    # Log freeze metadata to W&B (no-op if wandb not initialised yet)
+    log_freeze_info(freeze_result, freeze_cfg)
 
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr, momentum=args.momentum,
-        weight_decay=args.weight_decay
-    )
+    # ── Optimizer & Differential LR ──────────────────────────────────────────
+    optimizer_name = getattr(args, "optimizer", "sgd").lower()
+    custom_lr_fc = getattr(args, "lr_fc", None)
+
+    # Differential LR: separate fc params (e.g. classifier) from the backbone
+    if custom_lr_fc is not None:
+        backbone_params = []
+        fc_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("fc") or name.startswith("classifier"):
+                fc_params.append(p)
+            else:
+                backbone_params.append(p)
+        
+        param_groups = [
+            {"params": backbone_params, "lr": args.lr},
+            {"params": fc_params,      "lr": custom_lr_fc}
+        ]
+    else:
+        param_groups = [p for p in model.parameters() if p.requires_grad]
+
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            param_groups, lr=args.lr, momentum=args.momentum,
+            weight_decay=args.weight_decay
+        )
+    elif optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            param_groups, lr=args.lr, weight_decay=args.weight_decay
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            param_groups, lr=args.lr, weight_decay=args.weight_decay
+        )
+    else:
+        raise ValueError(f"Unknown optimizer '{optimizer_name}'")
+
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
 
     # ── LR scheduler ─────────────────────────────────────────────────────────
     if not args.test_only:
         iters_per_epoch = len(data_loader)
-        lr_milestones = [
-            iters_per_epoch * (m - args.lr_warmup_epochs)
-            for m in args.lr_milestones
-        ]
-        main_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=lr_milestones, gamma=args.lr_gamma
-        )
+        scheduler_name = getattr(args, "lr_scheduler", "multisteplr").lower()
 
-        if args.lr_warmup_epochs > 0:
+        if scheduler_name == "multisteplr":
+            lr_milestones = [
+                iters_per_epoch * (m - args.lr_warmup_epochs)
+                for m in getattr(args, "lr_milestones", [20, 30, 40])
+            ]
+            main_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=lr_milestones, gamma=args.lr_gamma
+            )
+        elif scheduler_name == "cosineannealinglr":
+            main_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=args.epochs * iters_per_epoch, 
+                eta_min=getattr(args, "lr_min", 0.0)
+            )
+        elif scheduler_name == "reducelronplateau":
+            main_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="max", factor=args.lr_gamma, 
+                patience=getattr(args, "lr_patience", 3)
+            )
+        else:
+            raise ValueError(f"Unknown lr_scheduler '{scheduler_name}'")
+
+        if getattr(args, "lr_warmup_epochs", 0) > 0 and scheduler_name != "reducelronplateau":
             warmup_iters = iters_per_epoch * args.lr_warmup_epochs
             args.lr_warmup_method = args.lr_warmup_method.lower()
             if args.lr_warmup_method == "linear":
@@ -373,8 +498,7 @@ def main(args):
                 )
             else:
                 raise RuntimeError(
-                    f"Invalid warmup lr method '{args.lr_warmup_method}'. "
-                    "Only linear and constant are supported."
+                    f"Invalid warmup lr method '{args.lr_warmup_method}'."
                 )
             lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
                 optimizer,
@@ -415,15 +539,25 @@ def main(args):
 
     best_acc1 = 0.0
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
+        scheduler_pass = lr_scheduler
+        if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
+            # ReduceLROnPlateau steps after validation, not during training loop batches
+            scheduler_pass = utils.SmoothedValue() # Dummy to not fail inside train_one_epoch step()
 
         train_one_epoch(
-            model, criterion, optimizer, lr_scheduler,
+            model, criterion, optimizer, scheduler_pass,
             data_loader, device, epoch, args.print_freq, scaler
         )
 
-        acc1 = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch)
+        # train_val → for hyperparameter tuning and early stopping
+        print("\n── Evaluating on train_val (hyper-param split) ──")
+        tv_acc1 = evaluate(model, criterion, data_loader_tv,   device=device, epoch=epoch)
+        # held-out val → never used for model selection, just for tracking
+        print("── Evaluating on held-out val ──")
+        _        = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch)
+
+        if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
+            lr_scheduler.step(tv_acc1)
 
         # ── Checkpoint saving ─────────────────────────────────────────────
         if utils.is_main_process():
@@ -440,14 +574,18 @@ def main(args):
             # Always keep a rolling checkpoint
             checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
             utils.save_on_master(checkpoint, checkpoint_path)
+            
+            # Save a checkpoint for EVERY epoch
+            epoch_path = os.path.join(checkpoint_dir, f"model_{epoch}.pth")
+            utils.save_on_master(checkpoint, epoch_path)
 
-            # Save best model as model.pth
-            if acc1 > best_acc1:
-                best_acc1 = acc1
+            # Best model selected on train_val (never on held-out val)
+            if tv_acc1 > best_acc1:
+                best_acc1 = tv_acc1
                 best_path = os.path.join(checkpoint_dir, "model.pth")
                 utils.save_on_master(checkpoint, best_path)
-                print(f"  ↑ New best val acc1 = {best_acc1:.3f}  →  saved to {best_path}")
-                wandb.log({"val/best_acc1": best_acc1, "epoch": epoch})
+                print(f"  ↑ New best train_val acc1 = {best_acc1:.3f}  →  saved to {best_path}")
+                wandb.log({"train_val/best_acc1": best_acc1, "epoch": epoch})
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -491,6 +629,8 @@ def get_args_parser(add_help=True):
     # ── Model ─────────────────────────────────────────────────────────────
     parser.add_argument("--model", default="r2plus1d_18", type=str)
     parser.add_argument("--weights", default=None, type=str)
+    parser.add_argument("--pretrained-path", default="", type=str, 
+                        help="Path to a custom local .pth checkpoint for pretrained weights")
 
     # ── Training ──────────────────────────────────────────────────────────
     parser.add_argument("--device", default="cuda", type=str)
@@ -499,15 +639,21 @@ def get_args_parser(add_help=True):
     parser.add_argument("-j", "--workers", default=10, type=int)
 
     parser.add_argument("--lr", default=0.01, type=float)
+    parser.add_argument("--lr-fc", default=None, type=float, help="Differential LR for only fc layer")
+    parser.add_argument("--optimizer", default="sgd", type=str, choices=["sgd", "adam", "adamw"])
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--wd", "--weight-decay", default=1e-4, type=float,
                         dest="weight_decay")
 
+    parser.add_argument("--lr-scheduler", default="multisteplr", type=str, 
+                        choices=["multisteplr", "cosineannealinglr", "reducelronplateau"])
     parser.add_argument("--lr-milestones", nargs="+", default=[20, 30, 40], type=int)
     parser.add_argument("--lr-gamma", default=0.1, type=float)
     parser.add_argument("--lr-warmup-epochs", default=10, type=int)
     parser.add_argument("--lr-warmup-method", default="linear", type=str)
     parser.add_argument("--lr-warmup-decay", default=0.001, type=float)
+    parser.add_argument("--lr-min", default=0.0, type=float, help="Min LR for cosineannealinglr")
+    parser.add_argument("--lr-patience", default=3, type=int, help="Patience for reducelronplateau")
 
     # ── Clip / frame ──────────────────────────────────────────────────────
     parser.add_argument("--clip-len", default=8, type=int)
@@ -530,7 +676,55 @@ def get_args_parser(add_help=True):
     parser.add_argument("--sync-bn", dest="sync_bn", action="store_true")
     parser.add_argument("--test-only", dest="test_only", action="store_true")
     parser.add_argument("--use-deterministic-algorithms", action="store_true")
-    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp for mixed precision training")
+
+    # ── Freezing ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--freeze-strategy",
+        default="",
+        dest="freeze_strategy",
+        help=(
+            "Named layer-freezing strategy.  "
+            f"Valid choices: {VALID_STRATEGIES}.  "
+            "Overrides --freeze-ratio when both are set.  "
+            "Leave empty to use ratio-based freezing or no freezing."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-ratio",
+        default=None,
+        type=float,
+        dest="freeze_ratio",
+        metavar="R",
+        help=(
+            "Ratio-based freezing: freeze the first R fraction of parameters "
+            "(e.g. 0.7 freezes the first 70%%).  "
+            "Used only when --freeze-strategy is not set."
+        ),
+    )
+
+    # ── Subset / split ────────────────────────────────────────────────────
+    parser.add_argument(
+        "--subset-size",
+        default=50_000,
+        type=int,
+        dest="subset_size",
+        help="Number of training videos to subsample (0 = use all).  Default: 50000.",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        default=0.2,
+        type=float,
+        dest="val_fraction",
+        help="Fraction of the subset to use as train_val (stratified).  Default: 0.2.",
+    )
+    parser.add_argument(
+        "--split-seed",
+        default=42,
+        type=int,
+        dest="split_seed",
+        help="RNG seed for reproducible stratified split.  Default: 42.",
+    )
 
     # ── Distributed ───────────────────────────────────────────────────────
     parser.add_argument("--world-size", default=1, type=int)

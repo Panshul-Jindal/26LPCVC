@@ -1,4 +1,3 @@
-.mp4
 dataset
 full_dataset
 processed_val_112
@@ -9,3 +8,5 @@ refactor_backup_map.jsonl
 references
 sampled_manifest.jsonl
 dataset-export.h5
+model
+export_assets

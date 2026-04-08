@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 #  Experiment identity
 # ─────────────────────────────────────────────
-exp_name: resnet_base
+exp_name: resnet_freezeL3L4_adam_cosine_lr_0001_lr_fc_001
 
 # ─────────────────────────────────────────────
 #  Data
@@ -23,12 +23,13 @@ split_seed: 42 # RNG seed for reproducibility
 # ─────────────────────────────────────────────
 model: r2plus1d_18
 weights: null # torchvision weights enum name, e.g. R2Plus1D_18_Weights.DEFAULT
+pretrained_path: model/R(2+1)D._18.pth
 
 # ─────────────────────────────────────────────
 #  Freezing (hybrid: named strategy OR ratio)
 #  Priority: freeze_strategy > freeze_ratio > no freezing
 # ─────────────────────────────────────────────
-freeze_strategy: r2plus1d_layer4_only # see VALID_STRATEGIES in freeze_utils.py
+freeze_strategy: r2plus1d_layer3_4 # see VALID_STRATEGIES in freeze_utils.py
 freeze_ratio: null # e.g. 0.7  (used only when freeze_strategy is empty)
 
 # ─────────────────────────────────────────────
@@ -38,15 +39,18 @@ epochs: 15
 batch_size: 24
 workers: 10
 
-lr: 0.01
-momentum: 0.9
+# Optimizer & Differential LR
+optimizer: adam
+lr: 1.0e-4 # backbone learning rate
+lr_fc: 1.0e-3 # fully connected / classifier layer learning rate
 weight_decay: 1.0e-4
 
-lr_milestones: [20, 30, 40]
-lr_gamma: 0.1
-lr_warmup_epochs: 10
+# Learning Rate Scheduler
+lr_scheduler: cosineannealinglr
+lr_min: 1.0e-6
+lr_warmup_epochs: 2 # still works with cosine since we use SequentialLR
 lr_warmup_method: linear
-lr_warmup_decay: 0.001
+lr_warmup_decay: 0.01
 
 # ─────────────────────────────────────────────
 #  Clip / frame settings
