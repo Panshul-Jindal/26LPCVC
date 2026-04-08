@@ -10,3 +10,4 @@ sampled_manifest.jsonl
 dataset-export.h5
 model
 export_assets
+logs
