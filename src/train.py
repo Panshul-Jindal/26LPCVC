@@ -332,26 +332,39 @@ def main(args):
     if not args.test_only:
         # train_train: shuffle=True via DataLoader, no clip sampler needed
         # (SubsetVideoDataset already maps sequential indices to the right clips)
-        train_val_sampler = UniformClipSampler(dataset_tv.video_clips, args.clips_per_video)
         if args.distributed:
-            train_val_sampler = DistributedSampler(train_val_sampler, shuffle=False)
+            train_sampler = DistributedSampler(dataset)
+        else:
+            train_sampler = None
+        
+        # train_val: Uniform sampling is now natively handled inside build_stratified_split
+        # so we can just use the default sequential DistributedSampler if needed.
+        if args.distributed:
+            train_val_sampler = DistributedSampler(dataset_tv, shuffle=False)
+        else:
+            train_val_sampler = None
 
         data_loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
             num_workers=args.workers,
             pin_memory=True,
             collate_fn=collate_fn,
+            persistent_workers=True,
         )
         data_loader_tv = torch.utils.data.DataLoader(
             dataset_tv,
             batch_size=args.batch_size,
             sampler=train_val_sampler,
+            shuffle=False,
             num_workers=args.workers,
             pin_memory=True,
             collate_fn=collate_fn,
+            persistent_workers=True,
         )
+
 
     data_loader_test = torch.utils.data.DataLoader(
         dataset_test,
@@ -360,6 +373,7 @@ def main(args):
         num_workers=args.workers,
         pin_memory=True,
         collate_fn=collate_fn,
+        persistent_workers=True,
     )
 
     if args.test_only:
@@ -539,6 +553,9 @@ def main(args):
 
     best_acc1 = 0.0
     for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed and hasattr(data_loader.sampler, "set_epoch"):
+            data_loader.sampler.set_epoch(epoch)
+            
         scheduler_pass = lr_scheduler
         if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
             # ReduceLROnPlateau steps after validation, not during training loop batches
