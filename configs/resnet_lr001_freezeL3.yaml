@@ -1,0 +1,9 @@
+exp_name: resnet_lr001_freezeL3
+
+model: tsm_resnet50
+lr: 0.001
+batch_size: 4
+epochs: 5
+
+freeze_until: layer3
+use_amp: true

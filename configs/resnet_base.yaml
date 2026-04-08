@@ -1,0 +1,67 @@
+# ─────────────────────────────────────────────
+#  Experiment identity
+# ─────────────────────────────────────────────
+exp_name: resnet_base
+
+# ─────────────────────────────────────────────
+#  Data
+# ─────────────────────────────────────────────
+data_path: ./full_dataset/
+kinetics_version: "400"
+
+# ─────────────────────────────────────────────
+#  Model
+# ─────────────────────────────────────────────
+model: r2plus1d_18
+weights: null # torchvision weights enum name, e.g. R2Plus1D_18_Weights.DEFAULT
+
+# ─────────────────────────────────────────────
+#  Training hyperparameters
+# ─────────────────────────────────────────────
+epochs: 15
+batch_size: 24
+workers: 10
+
+lr: 0.01
+momentum: 0.9
+weight_decay: 1.0e-4
+
+lr_milestones: [20, 30, 40]
+lr_gamma: 0.1
+lr_warmup_epochs: 10
+lr_warmup_method: linear
+lr_warmup_decay: 0.001
+
+# ─────────────────────────────────────────────
+#  Clip / frame settings
+# ─────────────────────────────────────────────
+clip_len: 8
+frame_rate: 4
+clips_per_video: 1
+
+# ─────────────────────────────────────────────
+#  Augmentation / pre-processing sizes
+# ─────────────────────────────────────────────
+val_resize_size: [128, 171]
+val_crop_size: [112, 112]
+train_resize_size: [128, 171]
+train_crop_size: [112, 112]
+
+# ─────────────────────────────────────────────
+#  Misc
+# ─────────────────────────────────────────────
+device: cuda
+print_freq: 10
+amp: false
+cache_dataset: false
+sync_bn: false
+use_deterministic_algorithms: false
+test_only: false
+resume: ""
+start_epoch: 0
+
+# ─────────────────────────────────────────────
+#  Distributed
+# ─────────────────────────────────────────────
+world_size: 1
+dist_url: "env://"
