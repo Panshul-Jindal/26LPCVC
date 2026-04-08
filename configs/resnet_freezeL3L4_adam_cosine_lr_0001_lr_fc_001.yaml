@@ -37,7 +37,7 @@ freeze_ratio: null # e.g. 0.7  (used only when freeze_strategy is empty)
 # ─────────────────────────────────────────────
 epochs: 15
 batch_size: 24
-workers: 10
+workers: 15
 
 # Optimizer & Differential LR
 optimizer: adam
@@ -73,7 +73,7 @@ train_crop_size: [112, 112]
 device: cuda
 print_freq: 10
 amp: false
-cache_dataset: false
+cache_dataset: true
 sync_bn: false
 use_deterministic_algorithms: false
 test_only: false
