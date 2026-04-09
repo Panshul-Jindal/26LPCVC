@@ -236,15 +236,13 @@ def build_stratified_split(
     )
 
     # ── Step 4: expand video → clip indices ──────────────────────────────────
-    # VideoClips stores, for each clip, which video it belongs to via
-    # video_clips.video_pts / cumulative_sizes.  The mapping clip→video is
-    # available through VideoClips.get_clip_location(clip_idx) which returns
-    # (video_idx, clip_idx_within_video).  We use it here to build a lookup.
-
     video_to_clips = _build_video_to_clips_map(dataset)
 
     train_clip_indices = _expand_videos_to_clips(train_videos, video_to_clips)
-    val_clip_indices   = _expand_videos_to_clips(val_videos,   video_to_clips)
+    
+    # We want train_val to mimic the test evaluation (e.g. 1 uniform clip per video)
+    # instead of wrapping it in UniformClipSampler (which raises TypeErrors on Subsets).
+    val_clip_indices = _expand_videos_to_clips(val_videos, video_to_clips, uniform_clips=1)
 
     print(
         f"[Split] train_train clips: {len(train_clip_indices):,}  |  "
@@ -279,9 +277,22 @@ def _build_video_to_clips_map(dataset: KineticsWithVideoId) -> Dict[int, List[in
 def _expand_videos_to_clips(
     video_indices:   List[int],
     video_to_clips:  Dict[int, List[int]],
+    uniform_clips:   int = 0
 ) -> List[int]:
-    """Flatten a list of video indices into their corresponding clip indices."""
+    """
+    Flatten a list of video indices into their corresponding clip indices.
+    If uniform_clips > 0, mimic UniformClipSampler by picking evenly spaced clips.
+    """
     clips: List[int] = []
     for vid in video_indices:
-        clips.extend(video_to_clips.get(vid, []))
+        v_clips = video_to_clips.get(vid, [])
+        if uniform_clips > 0 and len(v_clips) > 0:
+            if uniform_clips >= len(v_clips):
+                pass # keep all
+            else:
+                step = len(v_clips) / uniform_clips
+                # match UniformClipSampler math: i * step + step/2
+                idxs = [int(i * step + step / 2) for i in range(uniform_clips)]
+                v_clips = [v_clips[min(idx, len(v_clips)-1)] for idx in idxs]
+        clips.extend(v_clips)
     return clips

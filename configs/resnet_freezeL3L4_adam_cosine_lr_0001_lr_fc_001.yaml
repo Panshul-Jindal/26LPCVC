@@ -14,7 +14,7 @@ kinetics_version: "400"
 #  train_train + train_val come from full_dataset/train via stratified sampling.
 #  full_dataset/val is NEVER touched during training.
 # ─────────────────────────────────────────────
-subset_size: 50000 # videos to sample from train (0 = use all 190k)
+subset_size: 1000 # videos to sample from train (0 = use all 190k)
 val_fraction: 0.2 # fraction of subset → train_val  (50k * 0.2 = 10k)
 split_seed: 42 # RNG seed for reproducibility
 
@@ -23,7 +23,7 @@ split_seed: 42 # RNG seed for reproducibility
 # ─────────────────────────────────────────────
 model: r2plus1d_18
 weights: null # torchvision weights enum name, e.g. R2Plus1D_18_Weights.DEFAULT
-pretrained_path: model/R(2+1)D._18.pth
+pretrained_path: model/R(2+1)D_18.pth
 
 # ─────────────────────────────────────────────
 #  Freezing (hybrid: named strategy OR ratio)

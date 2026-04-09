@@ -21,7 +21,7 @@ from freeze_utils import (
     apply_freezing, print_trainability, log_freeze_info,
     get_run_tag, VALID_STRATEGIES,
 )
-
+from presets import VideoClassificationPresetTrain, VideoClassificationPresetEval
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Train loop
@@ -125,7 +125,7 @@ def evaluate(model, criterion, data_loader, device, epoch=None):
             f"It looks like the sampler has {num_data_from_sampler} samples, but "
             f"{num_processed_samples} samples were used for the validation, which might "
             "bias the results. Try adjusting the batch size and / or the world size. "
-            "Setting the world size to 1 is always a safe bet."
+            "Setting the world size to 1 is always aFIT safe bet."
         )
 
     metric_logger.synchronize_between_processes()
@@ -163,9 +163,6 @@ def evaluate(model, criterion, data_loader, device, epoch=None):
     return clip_acc1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_cache_path(filepath, args):
     import hashlib
@@ -200,7 +197,7 @@ def main(args):
     if utils.is_main_process():
         freeze_cfg = {
             "freeze_strategy": getattr(args, "freeze_strategy", ""),
-            "freeze_ratio":    getattr(args, "freeze_ratio", None),
+            "freeze_ratio":    getattr(args, "frFITeeze_ratio", None),
             "model_name":      getattr(args, "model", "unknown"),
             "lr":              args.lr,
         }
@@ -237,7 +234,7 @@ def main(args):
     val_dir   = os.path.join(args.data_path, "val")
 
     transform_train = presets.VideoClassificationPresetTrain(
-        crop_size=train_crop_size, resize_size=train_resize_size
+        crop_size=train_crop_size, resize_size=train_resize_size,
     )
     transform_eval = presets.VideoClassificationPresetEval(
         crop_size=val_crop_size, resize_size=val_resize_size
@@ -288,7 +285,7 @@ def main(args):
             if args.distributed:
                 print("Recommend pre-computing dataset cache on a single GPU first.")
             dataset_base = KineticsWithVideoId(
-                args.data_path,
+                args.data_path ,
                 frames_per_clip=args.clip_len,
                 num_classes=args.kinetics_version,
                 split="train",
@@ -330,18 +327,11 @@ def main(args):
         test_sampler = DistributedSampler(test_sampler, shuffle=False)
 
     if not args.test_only:
-        # train_train: shuffle=True via DataLoader, no clip sampler needed
-        # (SubsetVideoDataset already maps sequential indices to the right clips)
         if args.distributed:
             train_sampler = DistributedSampler(dataset)
-        else:
-            train_sampler = None
-        
-        # train_val: Uniform sampling is now natively handled inside build_stratified_split
-        # so we can just use the default sequential DistributedSampler if needed.
-        if args.distributed:
             train_val_sampler = DistributedSampler(dataset_tv, shuffle=False)
         else:
+            train_sampler = None
             train_val_sampler = None
 
         data_loader = torch.utils.data.DataLoader(
@@ -552,57 +542,83 @@ def main(args):
     start_time = time.time()
 
     best_acc1 = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed and hasattr(data_loader.sampler, "set_epoch"):
-            data_loader.sampler.set_epoch(epoch)
-            
-        scheduler_pass = lr_scheduler
-        if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
-            # ReduceLROnPlateau steps after validation, not during training loop batches
-            scheduler_pass = utils.SmoothedValue() # Dummy to not fail inside train_one_epoch step()
+    current_epoch = args.start_epoch
 
-        train_one_epoch(
-            model, criterion, optimizer, scheduler_pass,
-            data_loader, device, epoch, args.print_freq, scaler
-        )
+    try:
+        for epoch in range(args.start_epoch, args.epochs):
+            current_epoch = epoch
+            if args.distributed and hasattr(data_loader.sampler, "set_epoch"):
+                data_loader.sampler.set_epoch(epoch)
+                
+            scheduler_pass = lr_scheduler
+            if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
+                # ReduceLROnPlateau steps after validation, not during training loop batches
+                scheduler_pass = utils.SmoothedValue() # Dummy to not fail inside train_one_epoch step()
 
-        # train_val → for hyperparameter tuning and early stopping
-        print("\n── Evaluating on train_val (hyper-param split) ──")
-        tv_acc1 = evaluate(model, criterion, data_loader_tv,   device=device, epoch=epoch)
-        # held-out val → never used for model selection, just for tracking
-        print("── Evaluating on held-out val ──")
-        _        = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch)
+            train_one_epoch(
+                model, criterion, optimizer, scheduler_pass,
+                data_loader, device, epoch, args.print_freq, scaler
+            )
 
-        if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
-            lr_scheduler.step(tv_acc1)
+            # train_val → for hyperparameter tuning and early stopping
+            print("\n── Evaluating on train_val (hyper-param split) ──")
+            tv_acc1 = evaluate(model, criterion, data_loader_tv,   device=device, epoch=epoch)
+            # held-out val → never used for model selection, just for tracking
+            print("── Evaluating on held-out val ──")
+            _        = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch)
 
-        # ── Checkpoint saving ─────────────────────────────────────────────
+            if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
+                lr_scheduler.step(tv_acc1)
+
+            # ── Checkpoint saving ─────────────────────────────────────────────
+            if utils.is_main_process():
+                checkpoint = {
+                    "model":        model_without_ddp.state_dict(),
+                    "optimizer":    optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "epoch":        epoch,
+                    "args":         args,
+                }
+                if args.amp:
+                    checkpoint["scaler"] = scaler.state_dict()
+
+                # Always keep a rolling checkpoint
+                checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+                utils.save_on_master(checkpoint, checkpoint_path)
+                
+                # Save a checkpoint for EVERY epoch
+                epoch_path = os.path.join(checkpoint_dir, f"model_{epoch}.pth")
+                utils.save_on_master(checkpoint, epoch_path)
+
+                # Best model selected on train_val (never on held-out val)
+                if tv_acc1 > best_acc1:
+                    best_acc1 = tv_acc1
+                    best_path = os.path.join(checkpoint_dir, "model.pth")
+                    utils.save_on_master(checkpoint, best_path)
+                    print(f"  ↑ New best train_val acc1 = {best_acc1:.3f}  →  saved to {best_path}")
+                    wandb.log({"train_val/best_acc1": best_acc1, "epoch": epoch})
+
+    except (KeyboardInterrupt, Exception) as e:
+        print(f"\n[!] Training interrupted by {type(e).__name__}.")
         if utils.is_main_process():
+            print("[!] Saving emergency checkpoint...")
             checkpoint = {
                 "model":        model_without_ddp.state_dict(),
                 "optimizer":    optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
-                "epoch":        epoch,
+                "epoch":        current_epoch,
                 "args":         args,
             }
             if args.amp:
                 checkpoint["scaler"] = scaler.state_dict()
-
-            # Always keep a rolling checkpoint
-            checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
-            utils.save_on_master(checkpoint, checkpoint_path)
+            emergency_path = os.path.join(checkpoint_dir, "checkpoint_emergency.pth")
+            utils.save_on_master(checkpoint, emergency_path)
+            print(f"[!] Emergency checkpoint safely saved to: {emergency_path}")
             
-            # Save a checkpoint for EVERY epoch
-            epoch_path = os.path.join(checkpoint_dir, f"model_{epoch}.pth")
-            utils.save_on_master(checkpoint, epoch_path)
-
-            # Best model selected on train_val (never on held-out val)
-            if tv_acc1 > best_acc1:
-                best_acc1 = tv_acc1
-                best_path = os.path.join(checkpoint_dir, "model.pth")
-                utils.save_on_master(checkpoint, best_path)
-                print(f"  ↑ New best train_val acc1 = {best_acc1:.3f}  →  saved to {best_path}")
-                wandb.log({"train_val/best_acc1": best_acc1, "epoch": epoch})
+        if not isinstance(e, KeyboardInterrupt):
+            raise e
+        else:
+            print("[!] Exiting gracefully.")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

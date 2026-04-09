@@ -11,3 +11,4 @@ dataset-export.h5
 model
 export_assets
 logs
+*.mp4
