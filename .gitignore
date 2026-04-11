@@ -8,7 +8,14 @@ refactor_backup_map.jsonl
 references
 sampled_manifest.jsonl
 dataset-export.h5
-model
+models
 export_assets
 logs
 *.mp4
+EDA
+EDA_Results
+DataCleaning
+checkpoints
+metadata
+.agents
+preprocessing.log

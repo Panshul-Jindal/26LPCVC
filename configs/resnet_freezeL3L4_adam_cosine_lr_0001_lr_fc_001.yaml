@@ -23,7 +23,7 @@ split_seed: 42 # RNG seed for reproducibility
 # ─────────────────────────────────────────────
 model: r2plus1d_18
 weights: null # torchvision weights enum name, e.g. R2Plus1D_18_Weights.DEFAULT
-pretrained_path: model/R(2+1)D_18.pth
+pretrained_path: models/R(2+1)D_18.pth
 
 # ─────────────────────────────────────────────
 #  Freezing (hybrid: named strategy OR ratio)

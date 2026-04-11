@@ -2,7 +2,9 @@ import argparse
 import datetime
 import os
 import time
+import json
 import warnings
+import numpy as np
 from types import SimpleNamespace
 
 import yaml
@@ -15,8 +17,8 @@ import utils
 import wandb
 from torch import nn
 from torch.utils.data.dataloader import default_collate
-from torchvision.datasets.samplers import DistributedSampler, RandomClipSampler, UniformClipSampler
-from datasets import KineticsWithVideoId, SubsetVideoDataset, build_stratified_split
+from datasets import PreprocessedVideoDataset
+from model_wrapper import NormalizedModelWrapper
 from freeze_utils import (
     apply_freezing, print_trainability, log_freeze_info,
     get_run_tag, VALID_STRATEGIES,
@@ -35,7 +37,7 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler, data_loader,
     metric_logger.add_meter("clips/s", utils.SmoothedValue(window_size=10, fmt="{value:.3f}"))
 
     header = f"Epoch: [{epoch}]"
-    for video, _, target, _ in metric_logger.log_every(data_loader, print_freq, header):
+    for video, target, _ in metric_logger.log_every(data_loader, print_freq, header):
         start_time = time.time()
         video, target = video.to(device), target.to(device)
         with torch.cuda.amp.autocast(enabled=scaler is not None):
@@ -52,13 +54,12 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler, data_loader,
             loss.backward()
             optimizer.step()
 
-        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+        acc1 = utils.accuracy(output, target, topk=(1,))[0]
         batch_size = video.shape[0]
         clips_per_sec = batch_size / (time.time() - start_time)
 
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-        metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
         metric_logger.meters["clips/s"].update(clips_per_sec)
         lr_scheduler.step()
 
@@ -66,7 +67,6 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler, data_loader,
         wandb.log({
             "train/loss":      loss.item(),
             "train/acc1":      acc1.item(),
-            "train/acc5":      acc5.item(),
             "train/lr":        optimizer.param_groups[0]["lr"],
             "train/clips_per_sec": clips_per_sec,
             "epoch":           epoch,
@@ -77,90 +77,79 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler, data_loader,
 #  Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(model, criterion, data_loader, device, epoch=None):
+def evaluate(model, criterion, data_loader, device, epoch=None, split_prefix="val"):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = "Test:"
-    num_processed_samples = 0
-
-    # Group and aggregate clip predictions per video
-    num_videos = len(data_loader.dataset.samples)
-    num_classes = len(data_loader.dataset.classes)
-    agg_preds   = torch.zeros((num_videos, num_classes), dtype=torch.float32, device=device)
-    agg_targets = torch.zeros((num_videos,),             dtype=torch.int32,   device=device)
+    header = f"Test ({split_prefix}):"
+    
+    # Containers to collect all predictions and targets for macro metrics
+    all_preds = []
+    all_targets = []
 
     with torch.inference_mode():
-        for video, _, target, video_idx in metric_logger.log_every(data_loader, 100, header):
+        for video, target, _ in metric_logger.log_every(data_loader, 100, header):
             video  = video.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             output = model(video)
             loss   = criterion(output, target)
 
-            preds = torch.softmax(output, dim=1)
-            for b in range(video.size(0)):
-                idx = video_idx[b].item()
-                agg_preds[idx]   += preds[b].detach()
-                agg_targets[idx]  = target[b].detach().item()
-
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-            batch_size = video.shape[0]
             metric_logger.update(loss=loss.item())
-            metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-            metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
-            num_processed_samples += batch_size
-
-    # Gather stats from all processes
-    num_processed_samples = utils.reduce_across_processes(num_processed_samples)
-    if isinstance(data_loader.sampler, DistributedSampler):
-        num_data_from_sampler = len(data_loader.sampler.dataset)
-    else:
-        num_data_from_sampler = len(data_loader.sampler)
-
-    if (
-        hasattr(data_loader.dataset, "__len__")
-        and num_data_from_sampler != num_processed_samples
-        and utils.get_rank() == 0
-    ):
-        warnings.warn(
-            f"It looks like the sampler has {num_data_from_sampler} samples, but "
-            f"{num_processed_samples} samples were used for the validation, which might "
-            "bias the results. Try adjusting the batch size and / or the world size. "
-            "Setting the world size to 1 is always aFIT safe bet."
-        )
+            
+            # For macro metrics, collect class predictions
+            all_preds.append(output.argmax(dim=1).cpu())
+            all_targets.append(target.cpu())
 
     metric_logger.synchronize_between_processes()
+    avg_loss = metric_logger.loss.global_avg
 
-    clip_acc1 = metric_logger.acc1.global_avg
-    clip_acc5 = metric_logger.acc5.global_avg
-    val_loss  = metric_logger.loss.global_avg
-    print(
-        " * Clip Acc@1 {top1:.3f} Clip Acc@5 {top5:.3f}".format(
-            top1=clip_acc1, top5=clip_acc5
-        )
-    )
+    # Compute macro metrics
+    all_preds = torch.cat(all_preds).numpy()
+    all_targets = torch.cat(all_targets).numpy()
+    
+    # Micro Accuracy
+    micro_acc = (all_preds == all_targets).mean()
+    
+    # Macro Accuracy & F1
+    classes = np.unique(all_targets)
+    per_class_acc = []
+    per_class_f1 = []
+    
+    # Calculate for each class that exists in targets or preds
+    unique_labels = sorted(list(set(all_targets).union(set(all_preds))))
+    for c in unique_labels:
+        tp = ((all_preds == c) & (all_targets == c)).sum()
+        fp = ((all_preds == c) & (all_targets != c)).sum()
+        fn = ((all_preds != c) & (all_targets == c)).sum()
+        
+        # Recall (Acc per class)
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+        # Precision
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        
+        # Only count classes that actually exist in the targets for macro avg
+        if (all_targets == c).any():
+            per_class_acc.append(rec)
+            per_class_f1.append(f1)
 
-    # Aggregate across GPUs for video-level accuracy
-    if utils.is_dist_avail_and_initialized():
-        torch.distributed.barrier()
-        torch.distributed.all_reduce(agg_preds,   op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(agg_targets, op=torch.distributed.ReduceOp.MAX)
-    agg_acc1, agg_acc5 = utils.accuracy(agg_preds, agg_targets, topk=(1, 5))
-    print(" * Video Acc@1 {acc1:.3f} Video Acc@5 {acc5:.3f}".format(
-        acc1=agg_acc1, acc5=agg_acc5))
+    macro_acc = np.mean(per_class_acc) if per_class_acc else 0
+    macro_f1  = np.mean(per_class_f1) if per_class_f1 else 0
 
-    # --- W&B: validation logging ---
+    print(f" * [{split_prefix}] Loss: {avg_loss:.4f} Micro-Acc: {micro_acc*100:.2f}% Macro-Acc: {macro_acc*100:.2f}% Macro-F1: {macro_f1:.4f}")
+
+    # --- W&B: logging ---
     log_dict = {
-        "val/loss":       val_loss,
-        "val/clip_acc1":  clip_acc1,
-        "val/clip_acc5":  clip_acc5,
-        "val/video_acc1": agg_acc1.item() if hasattr(agg_acc1, "item") else float(agg_acc1),
-        "val/video_acc5": agg_acc5.item() if hasattr(agg_acc5, "item") else float(agg_acc5),
+        f"{split_prefix}/loss":      avg_loss,
+        f"{split_prefix}/micro_acc": micro_acc,
+        f"{split_prefix}/macro_acc": macro_acc,
+        f"{split_prefix}/macro_f1":  macro_f1,
     }
     if epoch is not None:
         log_dict["epoch"] = epoch
     wandb.log(log_dict)
 
-    return clip_acc1
+    return micro_acc
 
 
 
@@ -223,116 +212,45 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    # ── Data loading ──────────────────────────────────────────────────
-    print("Loading data")
-    val_resize_size   = tuple(args.val_resize_size)
-    val_crop_size     = tuple(args.val_crop_size)
-    train_resize_size = tuple(args.train_resize_size)
-    train_crop_size   = tuple(args.train_crop_size)
+    # ── New Preprocessed Data Loading ──────────────────────────────────────────
+    print("Loading data from manifest")
+    manifest_path = args.split_manifest
+    precomputed_root = args.preprocessed_dir
+    
+    with open(manifest_path, "r") as f:
+        manifest_meta = json.load(f)["metadata"]
+        
+    class_weights = torch.tensor(manifest_meta["class_weights"], dtype=torch.float32).to(device)
+    num_classes = manifest_meta["num_classes"]
 
-    train_dir = os.path.join(args.data_path, "train")
-    val_dir   = os.path.join(args.data_path, "val")
+    train_crop_size = tuple(args.train_crop_size)
+    val_crop_size   = tuple(args.val_crop_size)
 
-    transform_train = presets.VideoClassificationPresetTrain(
-        crop_size=train_crop_size, resize_size=train_resize_size,
-    )
-    transform_eval = presets.VideoClassificationPresetEval(
-        crop_size=val_crop_size, resize_size=val_resize_size
-    )
+    transform_train = presets.VideoClassificationPresetTrain(crop_size=train_crop_size)
+    transform_eval  = presets.VideoClassificationPresetEval(crop_size=val_crop_size)
 
-    # ── Original (held-out) val set ─ NEVER touched during training ────────
-    if args.weights and args.test_only:
-        transform_eval = torchvision.models.get_weight(args.weights).transforms()
+    dataset      = PreprocessedVideoDataset(precomputed_root, "train", manifest_path, transform=transform_train)
+    dataset_tv   = PreprocessedVideoDataset(precomputed_root, "val",   manifest_path, transform=transform_eval)
+    dataset_test = PreprocessedVideoDataset(precomputed_root, "test",  manifest_path, transform=transform_eval)
 
-    cache_path_val = _get_cache_path(val_dir, args)
-    if args.cache_dataset and os.path.exists(cache_path_val):
-        print(f"Loading dataset_test from {cache_path_val}")
-        dataset_test, _ = torch.load(cache_path_val, weights_only=False)
-        dataset_test.transform = transform_eval
-    else:
-        if args.distributed:
-            print("Recommend pre-computing dataset cache on a single GPU first.")
-        dataset_test = KineticsWithVideoId(
-            args.data_path,
-            frames_per_clip=args.clip_len,
-            num_classes=args.kinetics_version,
-            split="val",
-            step_between_clips=1,
-            transform=transform_eval,
-            frame_rate=args.frame_rate,
-            extensions=("avi", "mp4"),
-            output_format="TCHW",
-            num_workers=args.workers,
-        )
-        if args.cache_dataset:
-            print(f"Saving dataset_test to {cache_path_val}")
-            utils.mkdir(os.path.dirname(cache_path_val))
-            utils.save_on_master((dataset_test, val_dir), cache_path_val)
+    if args.subset_size > 0:
+        print(f"[Data] Subsampling {args.subset_size:,} training videos...")
+        indices = torch.randperm(len(dataset))[:args.subset_size].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
 
-    print(f"[Data] original val (held-out): {len(dataset_test.samples):,} videos")
-
-    if not args.test_only:
-        # ── Base training dataset (no copy, just metadata) ──────────────────────
-        print("Loading training data (building VideoClips index)...")
-        st = time.time()
-        cache_path_train = _get_cache_path(train_dir, args)
-
-        if args.cache_dataset and os.path.exists(cache_path_train):
-            print(f"Loading dataset_base from {cache_path_train}")
-            dataset_base, _ = torch.load(cache_path_train, weights_only=False)
-            dataset_base.transform = None          # transforms applied per-split
-        else:
-            if args.distributed:
-                print("Recommend pre-computing dataset cache on a single GPU first.")
-            dataset_base = KineticsWithVideoId(
-                args.data_path ,
-                frames_per_clip=args.clip_len,
-                num_classes=args.kinetics_version,
-                split="train",
-                step_between_clips=1,
-                transform=None,                    # applied later per-split
-                frame_rate=args.frame_rate,
-                extensions=("avi", "mp4"),
-                output_format="TCHW",
-                num_workers=args.workers,
-            )
-            if args.cache_dataset:
-                print(f"Saving dataset_base to {cache_path_train}")
-                utils.mkdir(os.path.dirname(cache_path_train))
-                utils.save_on_master((dataset_base, train_dir), cache_path_train)
-
-        print(f"  VideoClips index built in {time.time() - st:.1f}s")
-        print(f"  Total training videos: {len(dataset_base.samples):,}")
-
-        # ── Stratified split ───────────────────────────────────────────────
-        train_clip_idx, val_clip_idx = build_stratified_split(
-            dataset_base,
-            subset_size  = getattr(args, "subset_size",   50_000),
-            val_fraction = getattr(args, "val_fraction",  0.2),
-            seed         = getattr(args, "split_seed",    42),
-        )
-
-        # Zero-copy views with per-split transforms
-        dataset        = SubsetVideoDataset(dataset_base, train_clip_idx, transform=transform_train)
-        dataset_tv     = SubsetVideoDataset(dataset_base, val_clip_idx,   transform=transform_eval)
+    print(f"[Data] New Train: {len(dataset):,} | New Val: {len(dataset_tv):,} | Test (held-out): {len(dataset_test):,}")
 
     # ── Samplers ───────────────────────────────────────────────────────────
     print("Creating data loaders")
 
-    # Use simple sequential samplers for the subset views; the clip indices
-    # are already shuffled during split construction for train_train.
-    test_sampler = UniformClipSampler(dataset_test.video_clips, args.clips_per_video)
-
     if args.distributed:
-        test_sampler = DistributedSampler(test_sampler, shuffle=False)
-
-    if not args.test_only:
-        if args.distributed:
-            train_sampler = DistributedSampler(dataset)
-            train_val_sampler = DistributedSampler(dataset_tv, shuffle=False)
-        else:
-            train_sampler = None
-            train_val_sampler = None
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        train_val_sampler = torch.utils.data.distributed.DistributedSampler(dataset_tv, shuffle=False)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
+    else:
+        train_sampler = torch.utils.data.RandomSampler(dataset)
+        train_val_sampler = torch.utils.data.SequentialSampler(dataset_tv)
+        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
         data_loader = torch.utils.data.DataLoader(
             dataset,
@@ -366,13 +284,8 @@ def main(args):
         persistent_workers=True,
     )
 
-    if args.test_only:
-        num_classes = len(dataset_test.classes)
-    else:
-        num_classes = len(dataset_base.classes)
-        print(f"[Data] train_train clips: {len(dataset):,}  "
-              f"train_val clips: {len(dataset_tv):,}  "
-              f"held-out val videos: {len(dataset_test.samples):,}")
+    dataset_test.classes = dataset_tv.classes # match classes
+    print(f"[Data] train_train: {len(dataset):,} | train_val: {len(dataset_tv):,} | held-out test: {len(dataset_test):,}")
 
     # ── Model ───────────────────────────────────────────────────────────────
     print("Creating model")
@@ -398,11 +311,14 @@ def main(args):
         print(f"Pretrained weights loaded. Missing keys: {msg.missing_keys}")
         
     model.to(device)
+    
+    # Wrap model with normalization buffer
+    model = NormalizedModelWrapper(model)
 
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model = model.to(device)
 
     # ── Configurable layer freezing ──────────────────────────────────────────
     freeze_cfg = {
@@ -411,14 +327,19 @@ def main(args):
         "model_name":      args.model,
         "lr":              args.lr,
     }
-    freeze_result = apply_freezing(model, config=freeze_cfg)
+    # Freeze the underlying model so prefixes in freeze_utils (like "layer4", "fc") still work
+    freeze_result = apply_freezing(model.model, config=freeze_cfg)
     print(freeze_result)
     print_trainability(model, verbose=True)
-    # Log freeze metadata to W&B (no-op if wandb not initialised yet)
+    # Log freeze metadata to W&B
     log_freeze_info(freeze_result, freeze_cfg)
 
+    # Note: fc layer is part of the backbone in r2plus1d_18, 
+    # but NormalizedModelWrapper proxies attributes.
+    model.model.fc = nn.Linear(model.model.fc.in_features, num_classes)
+
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # ── Optimizer & Differential LR ──────────────────────────────────────────
     optimizer_name = getattr(args, "optimizer", "sgd").lower()
@@ -431,7 +352,8 @@ def main(args):
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if name.startswith("fc") or name.startswith("classifier"):
+            # Note: after wrapping, name starts with 'model.'
+            if name.startswith("model.fc") or name.startswith("model.classifier") or name.startswith("fc"):
                 fc_params.append(p)
             else:
                 backbone_params.append(p)
@@ -441,6 +363,7 @@ def main(args):
             {"params": fc_params,      "lr": custom_lr_fc}
         ]
     else:
+        # Filter again just in case some are frozen
         param_groups = [p for p in model.parameters() if p.requires_grad]
 
     if optimizer_name == "sgd":
@@ -519,8 +442,19 @@ def main(args):
         model_without_ddp = model.module
 
     if args.resume:
+        print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint["model"])
+        state_dict = checkpoint["model"]
+        
+        # Handle prefix mismatch for NormalizedModelWrapper
+        first_key = next(iter(state_dict))
+        is_wrapped = isinstance(model_without_ddp, NormalizedModelWrapper)
+        if is_wrapped and not first_key.startswith("model."):
+            print("Legacy checkpoint detected: Prepending 'model.' prefix to keys.")
+            state_dict = {"model." + k: v for k, v in state_dict.items()}
+            
+        msg = model_without_ddp.load_state_dict(state_dict, strict=False)
+        print(f"Checkpoint loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
         if not args.test_only:
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -562,13 +496,14 @@ def main(args):
 
             # train_val → for hyperparameter tuning and early stopping
             print("\n── Evaluating on train_val (hyper-param split) ──")
-            tv_acc1 = evaluate(model, criterion, data_loader_tv,   device=device, epoch=epoch)
-            # held-out val → never used for model selection, just for tracking
-            print("── Evaluating on held-out val ──")
-            _        = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch)
+            tv_macro_acc = evaluate(model, criterion, data_loader_tv,   device=device, epoch=epoch, split_prefix="train_val")
+            
+            # held-out test → never used for model selection, just for tracking
+            print("── Evaluating on held-out test ──")
+            _            = evaluate(model, criterion, data_loader_test, device=device, epoch=epoch, split_prefix="test")
 
             if getattr(args, "lr_scheduler", "").lower() == "reducelronplateau":
-                lr_scheduler.step(tv_acc1)
+                lr_scheduler.step(tv_macro_acc)
 
             # ── Checkpoint saving ─────────────────────────────────────────────
             if utils.is_main_process():
@@ -590,13 +525,13 @@ def main(args):
                 epoch_path = os.path.join(checkpoint_dir, f"model_{epoch}.pth")
                 utils.save_on_master(checkpoint, epoch_path)
 
-                # Best model selected on train_val (never on held-out val)
-                if tv_acc1 > best_acc1:
-                    best_acc1 = tv_acc1
+                # Best model selected on train_val (never on held-out test)
+                if tv_macro_acc > best_acc1:
+                    best_acc1 = tv_macro_acc
                     best_path = os.path.join(checkpoint_dir, "model.pth")
                     utils.save_on_master(checkpoint, best_path)
-                    print(f"  ↑ New best train_val acc1 = {best_acc1:.3f}  →  saved to {best_path}")
-                    wandb.log({"train_val/best_acc1": best_acc1, "epoch": epoch})
+                    print(f"  ↑ New best train_val macro_acc = {best_acc1:.3f}  →  saved to {best_path}")
+                    wandb.log({"train_val/best_macro_acc": best_acc1, "epoch": epoch})
 
     except (KeyboardInterrupt, Exception) as e:
         print(f"\n[!] Training interrupted by {type(e).__name__}.")
@@ -710,6 +645,8 @@ def get_args_parser(add_help=True):
     parser.add_argument("--test-only", dest="test_only", action="store_true")
     parser.add_argument("--use-deterministic-algorithms", action="store_true")
     parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp for mixed precision training")
+    parser.add_argument("--preprocessed-dir", default="/tmp/lpcvc_preprocessed", type=str)
+    parser.add_argument("--split-manifest", default="metadata/split_manifest.json", type=str)
 
     # ── Freezing ───────────────────────────────────────────────────────────
     parser.add_argument(

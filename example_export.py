@@ -251,7 +251,7 @@ def export_model(
     num_calibration_samples
         The number of calibration data samples
         to use for quantization. If not set, uses the default number
-        specified by the dataset. If model doesn't have a calibration dataset
+        specified by the dataset. If model doesn't ha # Stack into (B, C, T, H, W) ve a calibration dataset
         specified, this must be None.
     skip_compiling
         If set, skips compiling of model to format that can run on device.
@@ -301,7 +301,7 @@ def export_model(
         static_model_path = export_without_hub_access(
             MODEL_ID,
             device,
-            skip_profiling,
+            skip_profiling, # Stack into (B, C, T, H, W) 
             skip_inferencing,
             skip_downloading,
             skip_summary,
@@ -317,7 +317,7 @@ def export_model(
         name=device.name, attributes=device.attributes, os=device.os
     )[-1]
     chipset_attr = next(
-        (attr for attr in hub_device.attributes if "chipset" in attr), None
+        (attr for attr in hub_device.attributes if "ch # Stack into (B, C, T, H, W) ipset" in attr), None
     )
     chipset = chipset_attr.split(":")[-1] if chipset_attr else None
 
@@ -335,7 +335,7 @@ def export_model(
 
     if os.path.exists("model/model_29.pth"):  # Update this path to your model checkpoint
         ckpt = torch.load("model/model_29.pth", map_location="cpu", weights_only=False)
-        model.model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=True)
+        model.model.load_state_dict(ckpt["model"] if " # Stack into (B, C, T, H, W) model" in ckpt else ckpt, strict=True)
         
     # Provide a real sample input for the inference sanity check.
     # If data_dir is set to a directory of preprocessed .npy tensors, the first
@@ -353,7 +353,7 @@ def export_model(
         
         if os.path.exists(data_dir):
             for cls in sorted(os.listdir(data_dir)):
-                cls_dir = os.path.join(data_dir, cls)
+                cls_dir = os.path.join(data_dir, cls) # Stack into (B, C, T, H, W) 
                 if not os.path.isdir(cls_dir):
                     continue
                 for f in sorted(os.listdir(cls_dir)):
@@ -369,7 +369,7 @@ def export_model(
                         return {"video": [tensor_x.astype(np.float32)]}  # ← only 1 tensor
 
         # Fallback: random tensor
-        print("No .npy files found — using random tensor for inference.")
+        print("No .npy files found — using random tens # Stack into (B, C, T, H, W) or for inference.")
         return {"video": [np.random.randn(1, 3, t_frames, 112, 112).astype(np.float32)]}
 
     model._sample_inputs_impl = custom_sample_inputs
@@ -385,7 +385,7 @@ def export_model(
     # 2. Converts the PyTorch model to ONNX and quantizes the ONNX model.
     quantize_job: hub.client.QuantizeJob | None = None
     quantized_model: hub.Model | None = None
-    if precision != Precision.float:
+    if precision != Precision.float: # Stack into (B, C, T, H, W) 
         onnx_compile_job = compile_model(
             model,
             model_name,
@@ -416,7 +416,7 @@ def export_model(
         model_name,
         device,
         target_runtime,
-        precision,
+        precision, # Stack into (B, C, T, H, W) 
         quantized_model,
         input_spec=input_spec,
         extra_options=compile_options,
@@ -487,7 +487,7 @@ def export_model(
         torch_out = torch_inference(
             model,
             sample_inputs,
-            return_channel_last_output=target_runtime.channel_last_native_execution,
+            return_channel_last_output=target_runtime.c # Stack into (B, C, T, H, W) hannel_last_native_execution,
         )
         assert inference_job.wait().success, "Job failed: " + inference_job.url
         inference_result = inference_job.download_output_data()

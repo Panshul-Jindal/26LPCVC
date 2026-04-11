@@ -1,5 +1,5 @@
 from pathlib import Path
-from shutil import move
+from shutil import copyfile
 from bisect import bisect_right
 import json
 
@@ -30,47 +30,26 @@ class DatasetRefactorer():
         with open(label_path, 'r') as file:
             label_data = json.load(file)
         
-        import threading
-        from concurrent.futures import ThreadPoolExecutor
+        for label in label_data:
 
-        print(f"Loaded {len(label_data)} labels. Preparing to move remaining files...")
-        
-        log_lock = threading.Lock()
-
-        def process_label(label):
-            try:
-                #get the video directory using video_path
-                video_path = Path(label['video_path'])
-                video_name = video_path.stem
-                video_location = self.get_video_directory(int(video_name)) / f'{video_name}.mp4'
-                
-                #get the video category_label
-                video_category = label['label']
-    
-                #get video split
-                video_split = label['split']
-    
-                # compute dest using root/split/category_label/video_path
-                dest_path = self.dataset_dest / str(video_split) / str(video_category).replace(' ', '_') / f'{video_name}.mp4'
-                
-                if not dest_path.parent.exists():
-                    with log_lock:
-                        dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                if not dest_path.exists() and video_location.exists():
-                    move(video_location, dest_path)
-                    with log_lock:
-                        with open('refactor_backup_map.jsonl', 'a') as backup_file:
-                            backup_file.write(json.dumps({"src": str(video_location), "dest": str(dest_path)}) + '\n')
-                    print(f'Moved file {video_location} to {dest_path}')
-            except Exception as e:
-                print(f"Error processing video {label['video_path']}: {e}")
-
-        # Use multiple workers since file I/O operations benefit from threading
-        with ThreadPoolExecutor(max_workers=32) as executor:
-            executor.map(process_label, label_data)
+            #get the video directory using video_path
+            video_path = Path(label['video_path'])
+            video_name = video_path.stem
+            video_location = self.get_video_directory(int(video_name)) / f'{video_name}.mp4'
             
-        print("Finished refactoring dataset.")
+            #get the video category_label
+            video_category = label['label']
+
+            #get video split
+            video_split = label['split']
+
+            # compute dest using root/split/category_label/video_path
+            dest_path = self.dataset_dest / str(video_split) / str(video_category).replace(' ', '_') / f'{video_name}.mp4'
+            if not dest_path.parent.exists():
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            if not dest_path.exists():
+                copyfile(video_location, dest_path)
+                print(f'Wrote file {video_location} to {dest_path}')   
 
     def get_label_range(self, data_path : Path):
         #returns inclusive range of video names
@@ -107,5 +86,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
